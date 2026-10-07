@@ -15,6 +15,39 @@
 #include "debug.h"
 #include "iomap.h"
 
+static void ntfs_iomap_read_end_io(struct bio *bio)
+{
+	int error = blk_status_to_errno(bio->bi_status);
+	struct folio_iter iter;
+
+	bio_for_each_folio_all(iter, bio) {
+		struct folio *folio = iter.folio;
+		struct ntfs_inode *ni = NTFS_I(folio->mapping->host);
+		s64 init_size;
+		loff_t pos = folio_pos(folio);
+
+		init_size = ni->initialized_size;
+		if (pos + iter.offset < init_size &&
+		    pos + iter.offset + iter.length > init_size)
+			folio_zero_segment(folio, offset_in_folio(folio, init_size),
+					   iter.offset + iter.length);
+
+		iomap_finish_folio_read(folio, iter.offset, iter.length, error);
+	}
+	bio_put(bio);
+}
+
+static void ntfs_iomap_bio_submit_read(const struct iomap_iter *iter,
+		struct iomap_read_folio_ctx *ctx)
+{
+	iomap_bio_submit_read_endio(iter, ctx, ntfs_iomap_read_end_io);
+}
+
+static const struct iomap_read_ops ntfs_iomap_bio_read_ops = {
+	.read_folio_range	= iomap_bio_read_folio_range,
+	.submit_read		= ntfs_iomap_bio_submit_read,
+};
+
 /*
  * ntfs_read_folio - Read data for a folio from the device
  * @file:	open file to which the folio @folio belongs or NULL
@@ -35,6 +68,10 @@
 static int ntfs_read_folio(struct file *file, struct folio *folio)
 {
 	struct ntfs_inode *ni = NTFS_I(folio->mapping->host);
+	struct iomap_read_folio_ctx ctx = {
+		.cur_folio = folio,
+		.ops = &ntfs_iomap_bio_read_ops,
+	};
 
 	/*
 	 * Only $DATA attributes can be encrypted and only unnamed $DATA
@@ -53,12 +90,20 @@ static int ntfs_read_folio(struct file *file, struct folio *folio)
 			folio_unlock(folio);
 			return -EOPNOTSUPP;
 		}
+		if (NInoWofCompressed(ni)) {
+#ifdef CONFIG_NTFS_FS_WOF_COMPRESSION
+			return ntfs_read_wof_compressed_block(folio);
+#else
+			folio_unlock(folio);
+			return -EOPNOTSUPP;
+#endif
+		}
 		/* Compressed data streams are handled in compress.c. */
 		if (NInoNonResident(ni) && NInoCompressed(ni))
 			return ntfs_read_compressed_block(folio);
 	}
 
-	iomap_bio_read_folio(folio, &ntfs_read_iomap_ops);
+	iomap_read_folio(&ntfs_read_iomap_ops, &ctx, NULL);
 	return 0;
 }
 
@@ -99,11 +144,12 @@ static sector_t ntfs_bmap(struct address_space *mapping, sector_t block)
 	ntfs_debug("Entering for mft_no 0x%llx, logical block 0x%llx.",
 			ni->mft_no, (unsigned long long)block);
 	if (ni->type != AT_DATA || !NInoNonResident(ni) || NInoEncrypted(ni) ||
-	    NInoMstProtected(ni)) {
+	    NInoWofCompressed(ni) || NInoMstProtected(ni)) {
 		ntfs_error(vol->sb, "BMAP does not make sense for %s attributes, returning 0.",
 				(ni->type != AT_DATA) ? "non-data" :
 				(!NInoNonResident(ni) ? "resident" :
-				"encrypted"));
+				(NInoWofCompressed(ni) ? "WOF-compressed" :
+				"encrypted")));
 		return 0;
 	}
 	/* None of these can happen. */
@@ -188,14 +234,19 @@ static void ntfs_readahead(struct readahead_control *rac)
 	struct address_space *mapping = rac->mapping;
 	struct inode *inode = mapping->host;
 	struct ntfs_inode *ni = NTFS_I(inode);
+	struct iomap_read_folio_ctx ctx = {
+		.ops = &ntfs_iomap_bio_read_ops,
+		.rac = rac,
+	};
 
 	/*
 	 * Resident files are not cached in the page cache,
 	 * and readahead is not implemented for compressed files.
 	 */
-	if (!NInoNonResident(ni) || NInoCompressed(ni))
+	if (!NInoNonResident(ni) || NInoCompressed(ni) ||
+	    NInoWofCompressed(ni))
 		return;
-	iomap_bio_readahead(rac, &ntfs_read_iomap_ops);
+	iomap_readahead(&ntfs_read_iomap_ops, &ctx, NULL);
 }
 
 static int ntfs_writepages(struct address_space *mapping,
@@ -208,6 +259,8 @@ static int ntfs_writepages(struct address_space *mapping,
 		.wbc		= wbc,
 		.ops		= &ntfs_writeback_ops,
 	};
+	bool need_iput = false;
+	int ret;
 
 	if (NVolShutdown(ni->vol))
 		return -EIO;
@@ -224,12 +277,28 @@ static int ntfs_writepages(struct address_space *mapping,
 		return -EOPNOTSUPP;
 	}
 
-	return iomap_writepages(&wpc);
+	/*
+	 * Prevent eviction in writeback to avoid deadlock in
+	 * ntfs_drop_big_inode().
+	 */
+	if ((ni->type == AT_DATA || ni->type == AT_INDEX_ALLOCATION) &&
+	    igrab(inode))
+		need_iput = true;
+
+	ret = iomap_writepages(&wpc);
+
+	if (need_iput)
+		iput(inode);
+
+	return ret;
 }
 
 static int ntfs_swap_activate(struct swap_info_struct *sis,
 		struct file *swap_file, sector_t *span)
 {
+	if (NInoWofCompressed(NTFS_I(file_inode(swap_file))))
+		return -EOPNOTSUPP;
+
 	return iomap_swapfile_activate(sis, swap_file, span,
 			&ntfs_read_iomap_ops);
 }
@@ -238,7 +307,6 @@ const struct address_space_operations ntfs_aops = {
 	.read_folio		= ntfs_read_folio,
 	.readahead		= ntfs_readahead,
 	.writepages		= ntfs_writepages,
-	.direct_IO		= noop_direct_IO,
 	.dirty_folio		= iomap_dirty_folio,
 	.bmap			= ntfs_bmap,
 	.migrate_folio		= filemap_migrate_folio,

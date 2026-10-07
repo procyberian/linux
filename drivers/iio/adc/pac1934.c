@@ -1108,6 +1108,10 @@ static int pac1934_acpi_parse_channel_config(struct i2c_client *client,
 			devm_kmemdup(dev, rez->package.elements[i].string.pointer,
 				     (size_t)rez->package.elements[i].string.length + 1,
 				     GFP_KERNEL);
+		if (!info->labels[idx]) {
+			ACPI_FREE(rez);
+			return -ENOMEM;
+		}
 		info->labels[idx][rez->package.elements[i].string.length] = '\0';
 		info->shunts[idx] = rez->package.elements[i + 1].integer.value * 1000;
 		info->active_channels[idx] = (info->shunts[idx] != 0);
@@ -1351,7 +1355,7 @@ static int pac1934_prep_iio_channels(struct pac1934_chip_info *info, struct iio_
 
 	dyn_ch_struct = devm_kzalloc(dev, channel_size, GFP_KERNEL);
 	if (!dyn_ch_struct)
-		return -EINVAL;
+		return -ENOMEM;
 
 	tmp_data = dyn_ch_struct;
 
